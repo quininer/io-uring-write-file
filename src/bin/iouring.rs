@@ -1,5 +1,6 @@
 use io_uring::opcode::types::Fd;
 use io_uring::opcode::Write;
+use io_uring::squeue::Flags;
 use io_uring::IoUring;
 use io_uring_write_file::{Timer, DATA, TOTAL};
 use libc::off_t;
@@ -7,7 +8,7 @@ use std::fs::File;
 use std::io;
 use std::os::unix::io::AsRawFd;
 
-const BATCH_SIZE: usize = 1024;
+const BATCH_SIZE: usize = 32;
 
 fn main() -> io::Result<()> {
     let file = File::create("iouring.text")?;
@@ -15,38 +16,45 @@ fn main() -> io::Result<()> {
     let mut uring = IoUring::new(BATCH_SIZE as u32 * 2)?;
 
     let (submitter, sq, cq) = uring.split();
-
-    let npages = TOTAL / DATA.len();
+    let mut sq = sq.available();
 
     let timer = Timer::start();
+
+    let mut submitted = 0;
     let mut completed = 0;
 
-    debug_assert!(npages % 1024 == 0);
-    let outer = npages / BATCH_SIZE;
-    for i in 0..outer {
-        for j in 0..BATCH_SIZE {
-            let n = i * BATCH_SIZE + j;
-            unsafe {
-                let entry = Write::new(Fd(file.as_raw_fd()), &DATA as *const u8, DATA.len() as u32)
-                    .offset((n * DATA.len()) as off_t)
-                    .build();
-                sq.available().push(entry).map_err(|_| {
-                    io::Error::new(io::ErrorKind::Other, "failed to push entry to sq")
-                })?;
+    while submitted != TOTAL {
+        unsafe {
+            let entry = Write::new(Fd(file.as_raw_fd()), DATA.as_ptr(), DATA.len() as u32)
+                .offset(submitted as off_t)
+                .build()
+                .flags(Flags::ASYNC);
+
+            match sq.push(entry) {
+                Ok(()) => submitted += DATA.len(),
+                Err(entry) => {
+                    sq.sync();
+                    completed += cq.available().count() * DATA.len();
+                    while let Err(err) = submitter.submit() {
+                        if err.raw_os_error() == Some(libc::EBUSY) {
+                            completed += cq.available().count() * DATA.len();
+                        } else {
+                            return Err(err)
+                        }
+                    }
+                    if sq.push(entry).is_ok() {
+                        submitted += DATA.len();
+                    }
+                }
             }
-        }
-        submitter.submit()?;
-        if i % 4 == 0 {
-            completed += cq.available().count();
         }
     }
 
-    while completed != npages {
-        let rest = npages - completed;
-        submitter.submit_and_wait(rest)?;
-        let count = cq.available().count();
-        // println!("count: {}", count);
-        completed += count
+    drop(sq);
+
+    while completed != TOTAL {
+        submitter.submit_and_wait(1)?;
+        completed += cq.available().count() * DATA.len();
     }
 
     let elapsed = timer.stop();
