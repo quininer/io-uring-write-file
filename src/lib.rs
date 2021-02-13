@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
-pub const TOTAL: usize = 5 * 1024 * 1024 * 1024;
-pub static DATA: [u8; 4096] = [0x61; 4096];
+pub const TOTAL: usize = 5 * 1024 * 1024 * 32;
+pub static DATA: &[u8] = &[0x61; 512 << 10];
 
 #[derive(Debug)]
 pub struct Timer(Instant);
